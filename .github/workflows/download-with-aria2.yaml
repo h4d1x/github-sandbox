@@ -1,176 +1,475 @@
-name: Dynamic Downloader Workflow
+name: Phats Downloader Workflow
 
 on:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
+  issue_comment:
+    types: [created]
 
 jobs:
-  download-and-process:
+  process_phats_command:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    if: >-
+      github.event.issue.pull_request == null &&
+      contains(github.event.comment.body, 'phats :')
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Parse command
+        id: parse_cmd
+        run: |
+          COMMENT="${{ github.event.comment.body }}"
+          
+          # استخراج مقادیر داخل کروشه‌ها
+          # الگو: phats : [query][count]
+          if [[ "$COMMENT" =~ phats\ :\ \[([^]]+)\]\[([^]]+)\] ]]; then
+            QUERY="${BASH_REMATCH[1]}"
+            COUNT="${BASH_REMATCH[2]}"
+            
+            echo "Query: $QUERY"
+            echo "Count (Max Videos): $COUNT"
+            
+            echo "query=$QUERY" >> $GITHUB_ENV
+            echo "count=$COUNT" >> $GITHUB_ENV
+            echo "valid_command=true" >> $GITHUB_ENV
+          else
+            echo "فرمت دستور نامعتبر است. باید به شکل phats : [query][count] باشد."
+            echo "valid_command=false" >> $GITHUB_ENV
+          fi
+
+      - name: Set up Python
+        if: env.valid_command == 'true'
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install Dependencies
+      - name: Install dependencies
+        if: env.valid_command == 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y aria2 zip
-          pip install requests beautifulsoup4 m3u8
+          pip install requests
+
+      - name: Prepare Workspace and Config
+        if: env.valid_command == 'true'
+        run: |
+          mkdir -p downloads
+          
+          cat <<EOF > tasks.json
+          {
+            "task_1": {
+              "status": "pending",
+              "query": "${{ env.query }}",
+              "max_videos": ${{ env.count }},
+              "max_pages": 10,
+              "quality": "720p"
+            }
+          }
+          EOF
 
       - name: Create Python Downloader Script
+        if: env.valid_command == 'true'
         run: |
           cat << 'EOF' > downloader.py
-          import json
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+
           import os
+          import sys
+          import re
+          import json
           import time
+          import fcntl
           import requests
-          import m3u8
           from urllib.parse import urljoin
-          
-          # تنظیمات اولیه
-          DOWNLOAD_DIR = "python_downloads"
-          os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-          
-          def download_hls(m3u8_url, output_filename):
+          from datetime import datetime
+
+          # ============ CONFIG ============
+          BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+          TASKS_FILE = os.path.join(BASE_DIR, 'tasks.json')
+          DOWNLOADS_DIR = os.path.join(BASE_DIR, 'downloads')
+          LOG_FILE = os.path.join(BASE_DIR, 'downloader.log')
+          LOCK_FILE = os.path.join(BASE_DIR, '.cron.lock')
+          RAW_HTML_DIR = os.path.join(BASE_DIR, 'raw_pages')
+          SAVE_ALL_SEARCH_PAGES = False
+
+          HEADERS = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              'Referer': 'https://www.pornhat.com/',
+              'Accept': '*/*',
+          }
+
+          QUALITY_MAP = {
+              '360p': 360,
+              '480p': 480,
+              '720p': 720,
+              '1080p': 1080
+          }
+
+          # ============ HELPERS ============
+          def log(msg):
+              timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+              line = f"[{timestamp}] {msg}"
+              print(line)
               try:
-                  # این یک پیاده‌سازی ساده برای دانلود HLS است (بر اساس اسکریپت شما)
-                  r = requests.get(m3u8_url, timeout=10)
-                  r.raise_for_status()
-                  playlist = m3u8.loads(r.text)
+                  with open(LOG_FILE, 'a', encoding='utf-8') as f:
+                      f.write(line + '\n')
+              except:
+                  pass
+
+          def load_tasks():
+              if not os.path.exists(TASKS_FILE):
+                  return {}
+              try:
+                  with open(TASKS_FILE, 'r', encoding='utf-8') as f:
+                      data = json.load(f)
+                  if isinstance(data, dict):
+                      return data
+                  elif isinstance(data, list):
+                      log("WARNING: tasks.json was a list, converting to dict")
+                      return {}
+                  else:
+                      return {}
+              except Exception as e:
+                  log(f"ERROR loading tasks: {e}")
+                  return {}
+
+          def save_tasks(tasks):
+              try:
+                  with open(TASKS_FILE, 'w', encoding='utf-8') as f:
+                      json.dump(tasks, f, indent=2, ensure_ascii=False)
+              except Exception as e:
+                  log(f"ERROR saving tasks: {e}")
+
+          def safe_filename(name):
+              return re.sub(r'[^\w\-\s]', '', str(name))[:80].strip() or 'video'
+
+          def safe_dirname(name):
+              return re.sub(r'[^\w\-]', '_', str(name)) or 'download'
+
+          # ============ HLS FUNCTIONS ============
+          def parse_master_playlist(content, preferred_quality):
+              lines = content.strip().split('\n')
+              streams = []
+              for i, line in enumerate(lines):
+                  if line.startswith('#EXT-X-STREAM-INF:'):
+                      res_match = re.search(r'RESOLUTION=(\d+)x(\d+)', line)
+                      if res_match and i + 1 < len(lines):
+                          height = int(res_match.group(2))
+                          url = lines[i + 1].strip()
+                          if url and not url.startswith('#'):
+                              streams.append({'height': height, 'url': url})
+              if not streams:
+                  return None
+              streams.sort(key=lambda x: x['height'])
+              target = QUALITY_MAP.get(preferred_quality, 720)
+              selected = streams[0]
+              for s in streams:
+                  if s['height'] <= target:
+                      selected = s
+                  else:
+                      break
+              log(f"    Selected quality: {selected['height']}p")
+              return selected['url']
+
+          def parse_variant_playlist(content, base_url):
+              lines = content.strip().split('\n')
+              segments = []
+              for line in lines:
+                  line = line.strip()
+                  if line and not line.startswith('#'):
+                      if line.startswith('http'):
+                          segments.append(line)
+                      else:
+                          segments.append(urljoin(base_url, line))
+              return segments
+
+          def download_hls_video(m3u8_url, output_path, preferred_quality, session):
+              try:
+                  log(f"    Fetching playlist...")
+                  resp = session.get(m3u8_url, headers=HEADERS, timeout=30)
+                  resp.raise_for_status()
+                  master_content = resp.text
                   
-                  with open(output_filename, 'wb') as outfile:
-                      for segment in playlist.segments:
-                          seg_url = urljoin(m3u8_url, segment.uri)
-                          res = requests.get(seg_url, timeout=10)
-                          outfile.write(res.content)
+                  if '#EXT-X-STREAM-INF:' in master_content:
+                      variant_url = parse_master_playlist(master_content, preferred_quality)
+                      if not variant_url:
+                          log(f"    ERROR: Could not parse master playlist")
+                          return False
+                      if not variant_url.startswith('http'):
+                          variant_url = urljoin(m3u8_url, variant_url)
+                      resp = session.get(variant_url, headers=HEADERS, timeout=30)
+                      resp.raise_for_status()
+                      variant_content = resp.text
+                      base_url = variant_url
+                  else:
+                      variant_content = master_content
+                      base_url = m3u8_url
+                  
+                  segments = parse_variant_playlist(variant_content, base_url)
+                  if not segments:
+                      log(f"    ERROR: No segments found")
+                      return False
+                  
+                  log(f"    Downloading {len(segments)} segments...")
+                  temp_path = output_path + '.tmp'
+                  with open(temp_path, 'wb') as outfile:
+                      for i, seg_url in enumerate(segments):
+                          try:
+                              seg_resp = session.get(seg_url, headers=HEADERS, timeout=60, stream=True)
+                              seg_resp.raise_for_status()
+                              for chunk in seg_resp.iter_content(chunk_size=1024*1024):
+                                  if chunk:
+                                      outfile.write(chunk)
+                              if (i + 1) % 20 == 0:
+                                  log(f"      Progress: {i+1}/{len(segments)}")
+                          except Exception as e:
+                              log(f"    Segment {i} error: {e}")
+                              continue
+                  os.rename(temp_path, output_path)
+                  file_size = os.path.getsize(output_path)
+                  log(f"    SUCCESS: {file_size / (1024*1024):.2f} MB")
                   return True
               except Exception as e:
-                  print(f"Error downloading {m3u8_url}: {e}")
+                  log(f"    Download ERROR: {e}")
+                  if os.path.exists(output_path + '.tmp'):
+                      os.remove(output_path + '.tmp')
                   return False
 
-          def main():
-              if not os.path.exists('tasks.json'):
-                  print("No tasks.json found.")
-                  return
-                  
-              with open('tasks.json', 'r') as f:
-                  task = json.load(f)
-                  
-              query = task.get('search_keyword')
-              max_videos = task.get('max_videos', 1) # دریافت تعداد ویدیوها
-              
-              print(f"Starting search for: {query}, Target videos: {max_videos}")
-              downloaded_count = 0
-              page = 1
-              
-              # حلقه تا زمانی که تعداد ویدیوهای دانلود شده به سقف برسد ادامه دارد
-              while downloaded_count < max_videos:
-                  print(f"Crawling page {page}...")
-                  # شبیه‌سازی استخراج لینک‌ها (شما اینجا منطق دقیق سایت خود را جایگزین کنید)
-                  # فرض میکنیم از جستجو یک سری آدرس m3u8 به دست می‌آید
-                  # به دلیل نداشتن آدرس سایت هدف در این مکالمه، قالب کلی حفظ شده است:
-                  extracted_links = [] # لیست لینک‌های استخراج شده از صفحه
-                  
-                  # اگر هیچ لینکی در صفحه نبود، یعنی به انتهای نتایج رسیدیم
-                  if not extracted_links and page > 1: # (در نسخه واقعی شرط را بر اساس پاسخ سایت تنظیم کنید)
-                      break 
-                      
-                  for link in extracted_links:
-                      if downloaded_count >= max_videos:
-                          break
-                          
-                      filename = os.path.join(DOWNLOAD_DIR, f"{query}_video_{downloaded_count+1}.mp4")
-                      print(f"Downloading video {downloaded_count+1} of {max_videos}...")
-                      
-                      success = download_hls(link, filename)
-                      if success:
-                          downloaded_count += 1
-                          time.sleep(2) # تاخیر برای جلوگیری از مسدود شدن
-                          
-                  page += 1
-                  time.sleep(1)
-                  
-              print(f"Finished. Successfully downloaded {downloaded_count} videos.")
+          # ============ VIDEO EXTRACTION ============
+          def get_video_links(query, max_pages, max_videos, session, task_id=None):
+              videos = []
+              search_base = "https://www.pornhat.com/search/{}/"
+              os.makedirs(RAW_HTML_DIR, exist_ok=True)
 
-          if __name__ == "__main__":
+              for page in range(1, max_pages + 1):
+                  if len(videos) >= max_videos:
+                      break
+
+                  url = search_base.format(query.replace(' ', '-')) + (f"?page={page}" if page > 1 else "")
+                  log(f"  Fetching search page {page}...")
+
+                  try:
+                      resp = session.get(url, headers=HEADERS, timeout=30)
+                      dump = False
+                      if resp.status_code != 200:
+                          dump = True
+
+                      pattern = r'<a[^>]+href="(/video/[^"]+)"'
+                      found = re.findall(pattern, resp.text)
+
+                      if not found:
+                          dump = True
+                      if SAVE_ALL_SEARCH_PAGES:
+                          dump = True
+
+                      if dump:
+                          ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                          safe_q = safe_dirname(query)
+                          fname = f"{safe_q}_page{page}_{ts}.html"
+                          path = os.path.join(RAW_HTML_DIR, fname)
+                          with open(path, 'w', encoding='utf-8', errors='ignore') as f:
+                              f.write(resp.text)
+                          log(f"    Raw HTML dumped: {path}")
+
+                      if resp.status_code != 200:
+                          log(f"    Page {page} returned {resp.status_code}")
+                          break
+
+                      for v in found:
+                          full_url = urljoin("https://www.pornhat.com", v)
+                          if full_url not in videos:
+                              videos.append(full_url)
+                              if len(videos) >= max_videos:
+                                  break
+
+                      log(f"    Found {len(found)} videos (Total collected: {len(videos)}/{max_videos})")
+                      time.sleep(1)
+
+                  except Exception as e:
+                      log(f"    Error: {e}")
+                      break
+
+              return videos
+
+          def get_m3u8_url(video_url, session):
+              try:
+                  resp = session.get(video_url, headers=HEADERS, timeout=30)
+                  resp.raise_for_status()
+                  html = resp.text
+
+                  match = re.search(r'(https://www\.pornhat\.com/get_file[^"\']+)', html)
+                  if not match:
+                      return None
+
+                  get_file_url = match.group(1).replace('\\/', '/')
+                  log(f"    Found get_file URL")
+
+                  r = session.get(get_file_url, headers=HEADERS, timeout=30)
+                  r.raise_for_status()
+
+                  if '#EXTM3U' in r.text:
+                      return get_file_url
+                  return None
+              except Exception as e:
+                  log(f"    Error getting stream: {e}")
+                  return None
+
+          def get_video_title(video_url, session):
+              try:
+                  resp = session.get(video_url, headers=HEADERS, timeout=30)
+                  match = re.search(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', resp.text)
+                  if match:
+                      return match.group(1)
+                  match = re.search(r'<title>([^<]+)</title>', resp.text)
+                  if match:
+                      return match.group(1).split(' - ')[0].strip()
+                  slug = video_url.rstrip('/').split('/')[-1]
+                  return slug.replace('-', ' ')
+              except:
+                  return f"video_{int(time.time())}"
+
+          # ============ TASK PROCESSOR ============
+          def process_task(task_id, task):
+              log(f"=" * 50)
+              log(f"Task: {task.get('query', 'Unknown')}")
+              
+              max_videos = int(task.get('max_videos', 1))
+              log(f"Max Videos requested: {max_videos}")
+              
+              tasks = load_tasks()
+              if task_id in tasks:
+                  tasks[task_id]['status'] = 'running'
+                  tasks[task_id]['started_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                  save_tasks(tasks)
+              
+              output_dir = os.path.join(DOWNLOADS_DIR, safe_dirname(task.get('query', 'download')))
+              os.makedirs(output_dir, exist_ok=True)
+              
+              session = requests.Session()
+              
+              try:
+                  videos = get_video_links(
+                      task.get('query', ''),
+                      int(task.get('max_pages', 10)),
+                      max_videos,
+                      session,
+                      task_id
+                  )
+
+                  if not videos:
+                      tasks = load_tasks()
+                      if task_id in tasks:
+                          tasks[task_id]['status'] = 'failed'
+                          tasks[task_id]['message'] = 'No videos found'
+                          save_tasks(tasks)
+                      log("No videos found!")
+                      return
+                  
+                  tasks = load_tasks()
+                  if task_id in tasks:
+                      tasks[task_id]['total'] = len(videos)
+                      save_tasks(tasks)
+                  
+                  log(f"Proceeding to download {len(videos)} videos")
+                  
+                  downloaded = 0
+                  quality = task.get('quality', '720p')
+                  
+                  for i, video_url in enumerate(videos):
+                      if downloaded >= max_videos:
+                          log(f"Reached maximum requested videos ({max_videos}). Stopping.")
+                          break
+
+                      tasks = load_tasks()
+                      if task_id in tasks and tasks[task_id].get('status') == 'cancelled':
+                          log("Task cancelled!")
+                          return
+                      
+                      log(f"\n[{downloaded+1}/{max_videos}] {video_url}")
+                      
+                      title = get_video_title(video_url, session)
+                      filename = safe_filename(title) + '.mp4'
+                      output_path = os.path.join(output_dir, filename)
+                      
+                      if os.path.exists(output_path) and os.path.getsize(output_path) > 1024*1024:
+                          log(f"  Already exists, skipping")
+                          downloaded += 1
+                      else:
+                          m3u8_url = get_m3u8_url(video_url, session)
+                          if m3u8_url:
+                              log(f"  Title: {title[:50]}...")
+                              if download_hls_video(m3u8_url, output_path, quality, session):
+                                  downloaded += 1
+                          else:
+                              log(f"  Could not find m3u8 URL")
+                      
+                      tasks = load_tasks()
+                      if task_id in tasks:
+                          tasks[task_id]['downloaded'] = downloaded
+                          tasks[task_id]['progress'] = int((downloaded) / max_videos * 100)
+                          save_tasks(tasks)
+                      
+                      time.sleep(2)
+                  
+                  tasks = load_tasks()
+                  if task_id in tasks:
+                      tasks[task_id]['status'] = 'completed'
+                      tasks[task_id]['progress'] = 100
+                      tasks[task_id]['completed_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                      tasks[task_id]['message'] = f'Downloaded {downloaded}/{len(videos)} videos'
+                      save_tasks(tasks)
+                  
+                  log(f"\n✓ Task completed: {downloaded} videos downloaded")
+                  
+              except Exception as e:
+                  log(f"Task error: {e}")
+                  tasks = load_tasks()
+                  if task_id in tasks:
+                      tasks[task_id]['status'] = 'failed'
+                      tasks[task_id]['message'] = str(e)
+                      save_tasks(tasks)
+
+          # ============ MAIN ============
+          def main():
+              lock_fp = open(LOCK_FILE, 'w')
+              try:
+                  fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+              except IOError:
+                  return
+              
+              log("=== Downloader Started ===")
+              
+              try:
+                  tasks = load_tasks()
+                  if not tasks:
+                      log("No tasks found")
+                      return
+                  
+                  for task_id, task in tasks.items():
+                      if isinstance(task, dict) and task.get('status') == 'pending':
+                          log(f"Found pending task: {task_id}")
+                          process_task(task_id, task)
+                          break
+              finally:
+                  fcntl.flock(lock_fp, fcntl.LOCK_UN)
+                  lock_fp.close()
+
+          if __name__ == '__main__':
               main()
           EOF
 
-      - name: Extract Commands and Process Files
-        env:
-          COMMIT_MSG: ${{ github.event.head_commit.message }}
+      - name: Run Downloader
+        if: env.valid_command == 'true'
         run: |
-          mkdir -p tmp_downloads
-          
-          # پردازش دستور phats
-          if echo "$COMMIT_MSG" | grep -qEi "^phats\s*:\s*\[.*\]\[.*\]"; then
-            PHATS_QUERY=$(echo "$COMMIT_MSG" | sed -nE 's/^phats\s*:\s*\[(.*)\]\[(.*)\].*/\1/p')
-            PHATS_COUNT=$(echo "$COMMIT_MSG" | sed -nE 's/^phats\s*:\s*\[(.*)\]\[(.*)\].*/\2/p')
-            
-            echo "Detected phats command. Query: $PHATS_QUERY, Max Videos: $PHATS_COUNT"
-            
-            # تولید فایل تنظیمات برای اسکریپت پایتون (max_videos به جای max_pages)
-            echo "{\"search_keyword\": \"$PHATS_QUERY\", \"max_videos\": $PHATS_COUNT, \"status\": \"pending\"}" > tasks.json
-            
-            # اجرای اسکریپت پایتون
-            python downloader.py
-            
-            # انتقال فایل‌های دانلود شده توسط پایتون به پوشه موقت
-            if [ -d "python_downloads" ]; then
-              mv python_downloads/* tmp_downloads/ 2>/dev/null || true
-            fi
-            
-          # پردازش دستور download (لینک مستقیم)
-          elif echo "$COMMIT_MSG" | grep -qEi "^download\s*:"; then
-            URLS=$(echo "$COMMIT_MSG" | sed -nE 's/^download\s*:\s*(.*)/\1/p')
-            echo "Detected download command."
-            cd tmp_downloads
-            aria2c -x 16 -s 16 "$URLS"
-            cd ..
-            
-          # پردازش دستور download-zip
-          elif echo "$COMMIT_MSG" | grep -qEi "^download-zip\s*:"; then
-            URLS=$(echo "$COMMIT_MSG" | sed -nE 's/^download-zip\s*:\s*(.*)/\1/p')
-            echo "Detected download-zip command."
-            cd tmp_downloads
-            aria2c -x 16 -s 16 "$URLS"
-            cd ..
-          else
-            echo "No valid download command found in commit message."
-            exit 0
-          fi
+          python downloader.py
+          echo "محتوای tasks.json:"
+          cat tasks.json
+          echo -e "\nمحتوای لاگ:"
+          cat downloader.log || true
 
-      - name: Zip and Split Files
-        run: |
-          mkdir -p final_output
-          if [ "$(ls -A tmp_downloads 2>/dev/null)" ]; then
-            cd tmp_downloads
-            # فشرده‌سازی و تکه‌تکه کردن فایل‌ها (پارت‌های 49 مگابایتی)
-            zip -r -s 49m ../final_output/downloaded_files.zip ./*
-            cd ..
-          else
-            echo "No files were downloaded."
-          fi
-
-      - name: Commit and Push
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add final_output/
-          
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Auto-downloaded and processed files"
-            git push
-          fi
+      - name: Upload Downloaded Videos
+        if: env.valid_command == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: phats-videos-${{ env.query }}
+          path: downloads/
+          retention-days: 5

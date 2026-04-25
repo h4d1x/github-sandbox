@@ -14,46 +14,105 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install aria2
-        run: sudo apt-get install -y aria2
-
-      - name: Extract URLs and download files
+      - name: Install Dependencies (aria2, yt-dlp)
         run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 zip unzip jq
+          # نصب آخرین نسخه yt-dlp برای پشتیبانی کامل از سایت‌ها و سرچ
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+
+      - name: Extract URLs/Commands and Process Files
+        run: |
+          set -e # توقف اسکریپت در صورت بروز خطای بحرانی
+          
           MSG=$(git log -1 --pretty=%B)
           echo "Commit message: $MSG"
 
-          if echo "$MSG" | grep -qP 'download-zip:'; then
+          mkdir -p downloads tmp_downloads
+
+          # 1. بررسی دستور جدید phats : [query][count]
+          if echo "$MSG" | grep -qP 'phats\s*:\s*\[.*?\]\[\d+\]'; then
+            MODE="zip" # فایل‌های سرچ شده در نهایت زیپ می‌شوند
+            QUERY=$(echo "$MSG" | grep -oP 'phats\s*:\s*\[\K(.*?)(?=\]\[)')
+            COUNT=$(echo "$MSG" | grep -oP 'phats\s*:\s*\[.*?\]\[\K(\d+)(?=\])')
+
+            if [ -z "$QUERY" ] || [ -z "$COUNT" ]; then
+              echo "❌ Error: Could not parse search query or count."
+              exit 1
+            fi
+
+            echo "🔍 Command: PHATS Search"
+            echo "🔎 Query: $QUERY | 🔢 Count: $COUNT"
+
+            # استفاده از yt-dlp برای سرچ و دانلود فایل‌ها
+            # پیشوند phsearch برای سرچ مستقیم استفاده شده است
+            yt-dlp "phsearch${COUNT}:${QUERY}" \
+              -o "tmp_downloads/%(title)s.%(ext)s" \
+              --max-downloads "$COUNT" \
+              --restrict-filenames \
+              || echo "⚠️ Some downloads may have failed, proceeding with what we have."
+
+            # بررسی اینکه آیا فایلی دانلود شده است یا خیر
+            if [ -z "$(ls -A tmp_downloads)" ]; then
+               echo "❌ Error: No files were found or downloaded for this search."
+               exit 1
+            fi
+
+          # 2. بررسی دستور قدیمی download-zip:
+          elif echo "$MSG" | grep -qP 'download-zip:'; then
             MODE="zip"
             URL_LINE=$(echo "$MSG" | grep -oP 'download-zip:\s*\K.*')
+            
+            if [ -z "$URL_LINE" ]; then
+              echo "❌ Error: Empty URL list for download-zip."
+              exit 1
+            fi
+
+            for URL in $URL_LINE; do
+              echo "⬇️ Downloading $URL"
+              aria2c --split=2 --max-connection-per-server=2 --min-split-size=90M --dir="tmp_downloads" "$URL" || echo "⚠️ Failed to download $URL"
+            done
+
+          # 3. بررسی دستور قدیمی download:
           elif echo "$MSG" | grep -qP 'download:'; then
             MODE="normal"
             URL_LINE=$(echo "$MSG" | grep -oP 'download:\s*\K.*')
+            
+            if [ -z "$URL_LINE" ]; then
+              echo "❌ Error: Empty URL list for download."
+              exit 1
+            fi
+
+            for URL in $URL_LINE; do
+              echo "⬇️ Downloading $URL"
+              aria2c --split=2 --max-connection-per-server=2 --min-split-size=90M --dir="tmp_downloads" "$URL" || echo "⚠️ Failed to download $URL"
+            done
+
+          # اگر هیچ دستوری یافت نشد
           else
-            echo "❌ No download command found in commit message"
+            echo "⏭️ No valid download/search command found in commit message. Skipping."
+            exit 0 # خروج موفقیت آمیز تا اکشن قرمز نشود
+          fi
+
+          echo "⚙️ Processing files... Mode: $MODE"
+
+          # اگر فایلی در tmp_downloads نبود کلا خارج شو
+          if [ -z "$(ls -A tmp_downloads 2>/dev/null)" ]; then
+            echo "❌ No files exist in tmp_downloads. Aborting."
             exit 1
           fi
 
-          echo "Mode: $MODE"
-          mkdir -p downloads tmp_downloads
-
-          for URL in $URL_LINE; do
-            FILENAME=$(basename "$URL")
-            echo "⬇️ Downloading $URL -> $FILENAME"
-
-            aria2c \
-              --split=2 \
-              --max-connection-per-server=2 \
-              --min-split-size=90M \
-              --dir="tmp_downloads" \
-              "$URL"
-          done
-
+          # زیپ کردن فایل ها در صورت نیاز
           if [ "$MODE" = "zip" ]; then
             ARCHIVE_NAME="tmp_downloads/archive_$(date +%Y%m%d_%H%M%S).zip"
-            zip -j "$ARCHIVE_NAME" tmp_downloads/*
+            echo "📦 Zipping downloaded files to $ARCHIVE_NAME"
+            zip -j "$ARCHIVE_NAME" tmp_downloads/* || { echo "❌ Zipping failed"; exit 1; }
+            # پاک کردن فایل‌های اصلی پس از زیپ برای جلوگیری از حجم اضافه
+            find tmp_downloads -type f ! -name '*.zip' -delete
           fi
 
-          # Split any zip over 90MB using zip native split (unzip compatible)
+          # تکه تکه کردن فایل‌های بزرگتر از 90 مگابایت
           for FILE in tmp_downloads/*; do
             [ -f "$FILE" ] || continue
             SIZE=$(stat -c%s "$FILE")
@@ -62,9 +121,7 @@ jobs:
 
             if [ "$SIZE" -gt "$LIMIT" ]; then
               echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 ))MB — splitting with zip..."
-              # zip -s creates: file.zip, file.z01, file.z02, ...
-              #zip -s 90m "downloads/${BASENAME}.zip" --out "downloads/${BASENAME}.zip" "$FILE"
-              zip -s 90m "downloads/${BASENAME}.zip" -j "$FILE"
+              zip -s 90m "downloads/${BASENAME}.zip" -j "$FILE" || { echo "❌ Splitting failed for $BASENAME"; exit 1; }
               echo "✅ Parts: $(ls downloads/${BASENAME}* | wc -l)"
             else
               cp "$FILE" "downloads/$BASENAME"
@@ -75,6 +132,12 @@ jobs:
 
       - name: Commit & Push
         run: |
+          # اگر پوشه downloads خالی بود کامیت نکن
+          if [ -z "$(ls -A downloads 2>/dev/null)" ]; then
+            echo "⏭️ No final files to commit. Skipping."
+            exit 0
+          fi
+          
           BRANCH="${GITHUB_REF_NAME}"
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
